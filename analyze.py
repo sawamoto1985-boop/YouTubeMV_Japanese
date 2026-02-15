@@ -1,134 +1,101 @@
 import os
-import requests
-import json
 import base64
-import re
-import time
+import httpx
+import json
+from google import genai
+from google.genai import types
 from supabase import create_client
 
 # 環境変数
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 SB_URL = os.environ.get("SUPABASE_URL")
 SB_KEY = os.environ.get("SUPABASE_ANON_KEY")
-GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
 
+client = genai.Client(api_key=GEMINI_API_KEY)
 supabase = create_client(SB_URL, SB_KEY)
 
-def extract_json(text):
+def get_image_base64(url):
+    """サムネイル画像をURLから取得してBase64に変換"""
     try:
-        match = re.search(r'\{.*\}', text, re.DOTALL)
-        return json.loads(match.group()) if match else None
-    except:
+        resp = httpx.get(url, timeout=10.0)
+        return base64.b64encode(resp.content).decode("utf-8")
+    except Exception as e:
+        print(f"  ⚠️ 画像取得失敗: {e}")
         return None
 
-def get_unanalyzed_count():
-    """未解析データの総数を取得する"""
-    try:
-        res = supabase.table("YouTubeMV_Japanese") \
-            .select("id", count="exact", head=True) \
-            .eq("is_analyzed", False) \
-            .execute()
-        return res.count
-    except:
-        return "?"
+def analyze_videos():
+    # 未解析かつ一次抽出を通ったデータを取得
+    res = supabase.table("YouTubeMV_Japanese")\
+        .select("video_id, title, description, thumbnail_url, channel_title")\
+        .eq("is_analyzed", False)\
+        .limit(20).execute() # 一回の実行件数は任意に調整してください
 
-def analyze_batch(limit=10, session_total=0):
-    # 開始前の残り件数をチェック
-    remaining = get_unanalyzed_count()
-    print(f"\n📋 バッチ開始: {limit}件取得します (DB残り: {remaining}件)")
-    
-    res = supabase.table("YouTubeMV_Japanese") \
-        .select("video_id, thumbnail_url, title, channel_title") \
-        .eq("is_analyzed", False) \
-        .order("view_count", desc=True) \
-        .limit(limit) \
-        .execute()
+    if not res.data:
+        print("解析対象のデータがありません。")
+        return
 
-    videos = res.data
-    if not videos:
-        return 0
-
-    # 安定版の gemini-2.0-flash を使用
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_KEY}"
-    headers = {'Content-Type': 'application/json'}
-
-    for i, v in enumerate(videos):
-        current_session_count = session_total + (i + 1)
-        print(f"   ▶ [{current_session_count}件目] {v['title']}")
+    for video in res.data:
+        print(f"\n🔍 解析中: {video['title']}")
         
-        try:
-            img_data = requests.get(v['thumbnail_url']).content
-            b64_img = base64.b64encode(img_data).decode('utf-8')
+        img_b64 = get_image_base64(video['thumbnail_url'])
+        
+        prompt = f"""
+        あなたは日本の音楽業界に精通したエージェントです。提供された動画情報、サムネイル画像、そしてGoogle検索を駆使して、正確なデータを抽出してください。
 
-            prompt = (
-                f"動画タイトル: {v['title']}\n"
-                f"チャンネル名: {v['channel_title']}\n\n"
-                "指示:\n"
-                "サムネイルとタイトルから判断して、この動画は「アーティスト公式のMusic Video」ですか？\n"
-                "Live映像、歌ってみた、切り抜き、リアクション動画は false にしてください。\n"
-                "回答は以下のJSON形式のみで出力してください。\n"
-                "{\"is_official\": boolean, \"reason\": \"理由を短く\"}"
+        【動画情報】
+        タイトル: {video['title']}
+        チャンネル名: {video['channel_title']}
+        概要欄: {video['description'][:1500]}
+
+        【抽出ルール】
+        1. singer_name: 歌手/ユニットの正式名称。略称（例：ミスチル）ではなく正式名（例：Mr.Children）にすること。
+        2. song_title: 純粋な曲名のみ。タイトルにある【MV】、Official Video、(Full Ver.)などの装飾記号や文言は徹底的に排除すること。
+        3. tie_up: この曲が使われたアニメ、映画、ドラマ、CM等の作品名。概要欄に無ければGoogle検索で特定すること。無ければ「なし」と記載。
+        4. is_official_mv: 以下の条件をすべて満たす場合のみ true。
+           - 投稿者が本人、所属レーベル、または公式作品チャンネルである。
+           - 動画内容がカバー、ライブ、Shorts、ダイジェスト、広告ではない「Music Video」本編であること。
+        """
+
+        try:
+            # Gemini API呼び出し (Grounding: Google検索有効)
+            contents = [prompt]
+            if img_b64:
+                contents.append(types.Part.from_bytes(data=base64.b64decode(img_b64), mime_type="image/jpeg"))
+
+            response = client.models.generate_content(
+                model="gemini-2.0-flash",
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    tools=[types.Tool(google_search_retrieval=types.GoogleSearchRetrieval())],
+                    response_mime_type="application/json",
+                    response_schema={
+                        "type": "object",
+                        "properties": {
+                            "singer_name": {"type": "string"},
+                            "song_title": {"type": "string"},
+                            "tie_up": {"type": "string"},
+                            "is_official_mv": {"type": "boolean"}
+                        },
+                        "required": ["singer_name", "song_title", "tie_up", "is_official_mv"]
+                    }
+                )
             )
 
-            payload = {
-                "contents": [{
-                    "parts": [
-                        {"text": prompt},
-                        {"inline_data": {"mime_type": "image/jpeg", "data": b64_img}}
-                    ]
-                }]
-            }
+            result = response.parsed
 
-            response = requests.post(url, headers=headers, json=payload)
-            result = response.json()
-
-            if "error" in result:
-                msg = result['error']['message']
-                print(f"      ❌ APIエラー: {msg}")
-                print("      🧊 クールダウン中（60秒待機）...")
-                time.sleep(60)
-                continue
-
-            if 'candidates' in result:
-                ai_text = result['candidates'][0]['content']['parts'][0]['text']
-                json_data = extract_json(ai_text)
-                
-                if json_data:
-                    supabase.table("YouTubeMV_Japanese").update({
-                        "is_official_mv": json_data.get("is_official", False),
-                        "is_analyzed": True 
-                    }).eq("video_id", v['video_id']).execute()
-                    
-                    status = '✅ 公式' if json_data.get('is_official') else '❌ 対象外'
-                    reason = json_data.get('reason', '理由なし')
-                    print(f"      > 判定: {status} ({reason})")
-                else:
-                    print(f"      ⚠️ JSON解析失敗")
-            else:
-                print(f"      ⚠️ 想定外のエラー")
+            # DBへ反映
+            supabase.table("YouTubeMV_Japanese").update({
+                "singer_name": result.singer_name,
+                "song_title": result.song_title,
+                "tie_up": result.tie_up,
+                "is_official_mv": result.is_official_mv,
+                "is_analyzed": True
+            }).eq("video_id", video['video_id']).execute()
+            
+            print(f"✅ 解析完了: {result.singer_name} - {result.song_title} (Official: {result.is_official_mv})")
 
         except Exception as e:
-            print(f"      ⚠️ システムエラー: {e}")
-
-        # 進捗表示
-        remaining_now = get_unanalyzed_count()
-        print(f"      📊 [進捗] 今回の完了: {current_session_count}件 | DB残り: {remaining_now}件")
-        
-        # 15秒待機（必須）
-        print("      ⏳ 待機中(15秒)...")
-        time.sleep(15)
-    
-    return len(videos)
+            print(f"❌ 解析エラー ({video['video_id']}): {e}")
 
 if __name__ == "__main__":
-    total_processed_session = 0
-    print("🚀 解析プロセスを開始します...")
-    
-    while True:
-        count = analyze_batch(10, total_processed_session)
-        if count == 0:
-            print("\n🎉 すべての解析が完了しました！未解析データは0件です。")
-            break
-        
-        total_processed_session += count
-        print(f"\n🍵 バッチ休憩中... (今回合計: {total_processed_session}件 完了)")
-        time.sleep(10)
+    analyze_videos()

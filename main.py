@@ -14,87 +14,76 @@ youtube = build("youtube", "v3", developerKey=YOUTUBE_API_KEY)
 supabase = create_client(SB_URL, SB_KEY)
 
 def is_japanese(text):
-    """ひらがな、カタカナ、漢字が1文字でも含まれているか判定"""
-    if not text:
-        return False
-    # Unicodeの範囲: ひらがな(\u3040-\u309F)、カタカナ(\u30A0-\u30FF)、漢字(\u4E00-\u9FFF)
+    if not text: return False
     return bool(re.search(r'[\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF]', text))
 
 def fetch_yearly_mvs(year, count_limit=100):
     print(f"\n📅 {year}年のMVを収集しています...")
-    
     start_time = f"{year}-01-01T00:00:00Z"
     end_time = f"{year}-12-31T23:59:59Z"
-    
-    # 検索キーワードを「公式」などの日本語主体に
     query = "公式 MV -cover -歌ってみた -reaction -切り抜き -LIVE -カラオケ"
     
     videos = []
     next_page_token = None
     
-    # 指定件数に達するか、検索結果が尽きるまでループ
     while len(videos) < count_limit:
-        search_response = youtube.search().list(
-            q=query,
-            part="snippet",
-            maxResults=50,
-            type="video",
-            videoCategoryId="10",
-            relevanceLanguage="ja",
-            regionCode="JP",
-            publishedAfter=start_time,
-            publishedBefore=end_time,
-            order="viewCount",
-            pageToken=next_page_token
+        search_res = youtube.search().list(
+            q=query, part="id", maxResults=50, type="video",
+            videoCategoryId="10", relevanceLanguage="ja", regionCode="JP",
+            publishedAfter=start_time, publishedBefore=end_time,
+            order="viewCount", pageToken=next_page_token
         ).execute()
         
-        for item in search_response['items']:
+        v_ids = [item['id']['videoId'] for item in search_res.get('items', [])]
+        if not v_ids: break
+
+        # videos().list で「詳細データ」をまとめて取得
+        details_res = youtube.videos().list(
+            id=",".join(v_ids),
+            part="snippet,statistics,contentDetails" # contentDetailsで長さを取得
+        ).execute()
+
+        for item in details_res.get('items', []):
             snippet = item['snippet']
-            title = snippet['title']
-            description = snippet['description']
+            stats = item.get('statistics', {})
+            content_details = item.get('contentDetails', {})
             
-            # 【重要】日本語フィルター：タイトルか概要欄に日本語があればOK
+            title = snippet['title']
+            description = snippet.get('description', '')
+            duration = content_details.get('duration', '') # 例: PT4M20S
+
             if is_japanese(title) or is_japanese(description):
                 videos.append({
-                    "video_id": item['id']['videoId'],
+                    "video_id": item['id'],
                     "title": title,
                     "channel_title": snippet['channelTitle'],
                     "thumbnail_url": snippet['thumbnails']['high']['url'],
                     "published_at": snippet['publishedAt'],
-                    "view_count": 0,
+                    "view_count": int(stats.get('viewCount', 0)),
+                    "description": description[:1000],
+                    "duration": duration,
                     "is_analyzed": False
                 })
             
-            if len(videos) >= count_limit:
-                break
-            
-        next_page_token = search_response.get('nextPageToken')
-        if not next_page_token:
-            break
+            if len(videos) >= count_limit: break
+        next_page_token = search_res.get('nextPageToken')
+        if not next_page_token: break
             
     return videos[:count_limit]
 
 def save_to_supabase(videos):
     new_count = 0
     for v in videos:
-        # 重複チェック
         check = supabase.table("YouTubeMV_Japanese").select("video_id").eq("video_id", v["video_id"]).execute()
-        
         if not check.data:
             supabase.table("YouTubeMV_Japanese").insert(v).execute()
             new_count += 1
-            
-    print(f"  ✅ {new_count} 件の国内向け動画を保存しました。")
+    print(f"  ✅ {new_count} 件保存完了")
 
 if __name__ == "__main__":
-    # SQLでTRUNCATEした後、これを実行してください
     current_year = datetime.now().year
     for year in range(2011, current_year + 1):
         try:
             yearly_videos = fetch_yearly_mvs(year, 100)
             save_to_supabase(yearly_videos)
-            time.sleep(1) # API制限に配慮
-        except Exception as e:
-            print(f"  ❌ {year}年の収集に失敗しました: {e}")
-
-    print("\n🎉 国内向けMVの収集が完了しました！")
+            time.sleep(1)

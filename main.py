@@ -12,70 +12,95 @@ SB_KEY = os.environ.get("SUPABASE_ANON_KEY")
 supabase = create_client(SB_URL, SB_KEY)
 youtube = build('youtube', 'v3', developerKey=YT_API_KEY)
 
+# API消費カウンター
+total_quota_used = 0
+
 def is_japanese(text):
     if not text: return False
     return bool(re.search(r'[ぁ-んァ-ン一-龥]', text))
 
 def get_video_stats(video_ids):
+    global total_quota_used
     res = youtube.videos().list(part="statistics", id=",".join(video_ids)).execute()
+    total_quota_used += 1  # videos.list は 1ユニット
     return {item['id']: int(item['statistics'].get('viewCount', 0)) for item in res.get('items', [])}
 
 def fetch_and_save_mvs(target_count=1000):
+    global total_quota_used
     collected_data = []
     next_page_token = None
-    search_query = 'official music video | "MV" | "ミュージックビデオ"'
     
-    print(f"🚀 1000件の邦楽MV収集を開始します")
+    search_queries = [
+        'official music video "公式"',
+        'ミュージックビデオ',
+        'MV "official"',
+        '邦楽 最新'
+    ]
+    
+    print(f"🚀 邦楽MV収集（目標: {target_count}件）を開始します")
 
-    # 目標に達するまで最大50回ループ（1回50件取得）
-    for i in range(50): 
+    for q_text in search_queries:
         if len(collected_data) >= target_count:
             break
-
-        search_res = youtube.search().list(
-            q=search_query,
-            part="snippet", type="video", regionCode="JP",
-            relevanceLanguage="ja", order="date", maxResults=50,
-            pageToken=next_page_token
-        ).execute()
-
-        video_ids = [item['id']['videoId'] for item in search_res.get('items', [])]
-        if not video_ids: break
-        
-        stats_dict = get_video_stats(video_ids)
-
-        for item in search_res.get('items', []):
-            v_id = item['id']['videoId']
-            snippet = item['snippet']
-            title, desc, channel = snippet['title'], snippet['description'], snippet['channelTitle']
             
-            # 日本語フィルタ
-            if not (is_japanese(title) or is_japanese(desc) or is_japanese(channel)):
-                continue
+        print(f"🔍 検索クエリ: {q_text}")
+        next_page_token = None 
 
-            collected_data.append({
-                "video_id": v_id,
-                "title": title,
-                "description": desc,
-                "thumbnail_url": snippet['thumbnails']['high']['url'],
-                "published_at": snippet['publishedAt'],
-                "channel_title": channel,
-                "view_count": stats_dict.get(v_id, 0),
-                "is_analyzed": False
-            })
-            if len(collected_data) >= target_count: break
+        for i in range(10): 
+            if len(collected_data) >= target_count:
+                break
 
-        next_page_token = search_res.get('nextPageToken')
-        print(f"📈 進捗: {len(collected_data)} / {target_count} (Loop: {i+1})")
-        if not next_page_token: break
-        time.sleep(0.2) # 負荷軽減
+            search_res = youtube.search().list(
+                q=q_text,
+                part="snippet", type="video", regionCode="JP",
+                relevanceLanguage="ja", order="date", maxResults=50,
+                pageToken=next_page_token
+            ).execute()
+            
+            total_quota_used += 100  # search.list は 100ユニット
+
+            items = search_res.get('items', [])
+            if not items: break
+            
+            video_ids = [item['id']['videoId'] for item in items]
+            stats_dict = get_video_stats(video_ids)
+
+            for item in items:
+                v_id = item['id']['videoId']
+                snippet = item['snippet']
+                
+                if not (is_japanese(snippet['title']) or is_japanese(snippet['description']) or is_japanese(snippet['channelTitle'])):
+                    continue
+
+                collected_data.append({
+                    "video_id": v_id,
+                    "title": snippet['title'],
+                    "description": snippet['description'],
+                    "thumbnail_url": snippet['thumbnails']['high']['url'],
+                    "published_at": snippet['publishedAt'],
+                    "channel_title": snippet['channelTitle'],
+                    "view_count": stats_dict.get(v_id, 0),
+                    "is_analyzed": False
+                })
+
+            next_page_token = search_res.get('nextPageToken')
+            print(f"📈 累計取得: {len(collected_data)}件 / 消費API: {total_quota_used}ユニット")
+            
+            if not next_page_token: break
+            time.sleep(0.1)
 
     # Supabaseへ一括保存
     if collected_data:
-        for i in range(0, len(collected_data), 100):
-            batch = collected_data[i:i+100]
+        unique_data = list({v['video_id']: v for v in collected_data}.values())[:target_count]
+        for i in range(0, len(unique_data), 100):
+            batch = unique_data[i:i+100]
             supabase.table("YouTubeMV_Japanese").upsert(batch).execute()
-        print(f"✨ 完了: 合計 {len(collected_data)} 件を同期しました。")
+        
+        print("-" * 30)
+        print(f"✅ 最終結果: {len(unique_data)}件を同期完了")
+        print(f"📊 本日の総消費API: {total_quota_used} ユニット")
+        print(f"💡 残り推定: {10000 - total_quota_used} ユニット (無料枠内)")
+        print("-" * 30)
 
 if __name__ == "__main__":
     fetch_and_save_mvs(1000)

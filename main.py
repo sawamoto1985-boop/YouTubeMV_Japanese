@@ -1,106 +1,99 @@
 import os
-import time
+import requests
+import json
 import re
-from googleapiclient.discovery import build
+import base64
 from supabase import create_client
 
-# 環境変数
-YT_API_KEY = os.environ.get("YOUTUBE_API_KEY")
+# --- 設定（GitHub Secretsから取得） ---
 SB_URL = os.environ.get("SUPABASE_URL")
 SB_KEY = os.environ.get("SUPABASE_ANON_KEY")
+GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
 
+# Supabaseクライアント初期化
 supabase = create_client(SB_URL, SB_KEY)
-youtube = build('youtube', 'v3', developerKey=YT_API_KEY)
 
-# API消費カウンター
-total_quota_used = 0
+def extract_json(text):
+    """AIの回答からJSON部分のみを抽出する"""
+    try:
+        match = re.search(r'\{.*\}', text, re.DOTALL)
+        if match:
+            return json.loads(match.group())
+        return None
+    except Exception:
+        return None
 
-def is_japanese(text):
-    if not text: return False
-    return bool(re.search(r'[ぁ-んァ-ン一-龥]', text))
+def analyze_and_filter(limit=5):
+    # 解析待ちの動画を再生数順に取得
+    res = supabase.table("YouTubeMV_Japanese") \
+        .select("video_id, thumbnail_url, title, channel_title") \
+        .eq("is_analyzed", False) \
+        .order("view_count", desc=True) \
+        .limit(limit) \
+        .execute()
 
-def get_video_stats(video_ids):
-    global total_quota_used
-    res = youtube.videos().list(part="statistics", id=",".join(video_ids)).execute()
-    total_quota_used += 1  # videos.list は 1ユニット
-    return {item['id']: int(item['statistics'].get('viewCount', 0)) for item in res.get('items', [])}
+    videos = res.data
+    if not videos:
+        print("✅ 解析待ちの動画はありません。")
+        return
 
-def fetch_and_save_mvs(target_count=1000):
-    global total_quota_used
-    collected_data = []
-    next_page_token = None
-    
-    search_queries = [
-        'official music video "公式"',
-        'ミュージックビデオ',
-        'MV "official"',
-        '邦楽 最新'
-    ]
-    
-    print(f"🚀 邦楽MV収集（目標: {target_count}件）を開始します")
+    # 【2026年最新】無料枠の404エラーを回避するエンドポイント（v1beta）
+    api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_KEY}"
 
-    for q_text in search_queries:
-        if len(collected_data) >= target_count:
-            break
+    for v in videos:
+        print(f"🧐 判定・解析中: {v['title']}")
+        try:
+            # 1. サムネイル画像をダウンロードしてBase64に変換
+            img_response = requests.get(v['thumbnail_url'])
+            img_base64 = base64.b64encode(img_response.content).decode('utf-8')
             
-        print(f"🔍 検索クエリ: {q_text}")
-        next_page_token = None 
+            # 2. AIへの指示（プロンプト）
+            prompt = (
+                f"動画タイトル: {v['title']}\n"
+                f"チャンネル名: {v['channel_title']}\n\n"
+                "指示:\n"
+                "1. アーティスト本人の公式MVなら true、それ以外（ライブ、カバー、リアクション、切り抜き）は false。\n"
+                "2. 公式MVの場合、雰囲気や色を表すタグを5つ生成。\n"
+                "必ず以下のJSON形式のみで回答してください:\n"
+                "{\"is_official\": boolean, \"reason\": \"string\", \"tags\": [\"string\"]}"
+            )
 
-        for i in range(10): 
-            if len(collected_data) >= target_count:
-                break
+            # 3. APIリクエスト送信
+            payload = {
+                "contents": [{
+                    "parts": [
+                        {"text": prompt},
+                        {"inline_data": {"mime_type": "image/jpeg", "data": img_base64}}
+                    ]
+                }]
+            }
 
-            search_res = youtube.search().list(
-                q=q_text,
-                part="snippet", type="video", regionCode="JP",
-                relevanceLanguage="ja", order="date", maxResults=50,
-                pageToken=next_page_token
-            ).execute()
-            
-            total_quota_used += 100  # search.list は 100ユニット
+            response = requests.post(api_url, json=payload, headers={'Content-Type': 'application/json'})
+            resp_data = response.json()
 
-            items = search_res.get('items', [])
-            if not items: break
-            
-            video_ids = [item['id']['videoId'] for item in items]
-            stats_dict = get_video_stats(video_ids)
+            # APIエラーチェック
+            if 'error' in resp_data:
+                print(f"  ❌ APIエラー: {resp_data['error']['message']}")
+                continue
 
-            for item in items:
-                v_id = item['id']['videoId']
-                snippet = item['snippet']
+            # 4. 回答の解析とSupabaseの更新
+            ai_text = resp_data['candidates'][0]['content']['parts'][0]['text']
+            result = extract_json(ai_text)
+
+            if result:
+                supabase.table("YouTubeMV_Japanese").update({
+                    "is_official_mv": result.get("is_official", True),
+                    "ai_tags": result.get("tags", []),
+                    "is_analyzed": True
+                }).eq("video_id", v['video_id']).execute()
                 
-                if not (is_japanese(snippet['title']) or is_japanese(snippet['description']) or is_japanese(snippet['channelTitle'])):
-                    continue
+                status = "✅ 採用" if result.get("is_official") else "❌ 却下"
+                print(f"  > {status} | 理由: {result.get('reason')}")
+            else:
+                print(f"  ⚠️ JSON解析失敗: {ai_text[:50]}...")
 
-                collected_data.append({
-                    "video_id": v_id,
-                    "title": snippet['title'],
-                    "description": snippet['description'],
-                    "thumbnail_url": snippet['thumbnails']['high']['url'],
-                    "published_at": snippet['publishedAt'],
-                    "channel_title": snippet['channelTitle'],
-                    "view_count": stats_dict.get(v_id, 0),
-                    "is_analyzed": False
-                })
-
-            next_page_token = search_res.get('nextPageToken')
-            print(f"📈 累計取得: {len(collected_data)}件 / 消費API: {total_quota_used}ユニット")
-            
-            if not next_page_token: break
-            time.sleep(0.1)
-
-    # Supabaseへ一括保存
-    if collected_data:
-        unique_data = list({v['video_id']: v for v in collected_data}.values())[:target_count]
-        for i in range(0, len(unique_data), 100):
-            batch = unique_data[i:i+100]
-            supabase.table("YouTubeMV_Japanese").upsert(batch).execute()
-        
-        print("-" * 30)
-        print(f"✅ 最終結果: {len(unique_data)}件を同期完了")
-        print(f"📊 本日の総消費API: {total_quota_used} ユニット")
-        print(f"💡 残り推定: {10000 - total_quota_used} ユニット (無料枠内)")
-        print("-" * 30)
+        except Exception as e:
+            print(f"  ⚠️ 実行エラー: {str(e)}")
 
 if __name__ == "__main__":
-    fetch_and_save_mvs(1000)
+    analyze_and_filter(5)

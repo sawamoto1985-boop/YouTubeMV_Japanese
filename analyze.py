@@ -1,7 +1,7 @@
 import os
 import base64
 import httpx
-import json
+import time
 from google import genai
 from google.genai import types
 from supabase import create_client
@@ -24,40 +24,38 @@ def get_image_base64(url):
         return None
 
 def analyze_videos():
-    # 未解析かつ一次抽出を通ったデータを取得
+    # 未解析データを取得 (一度に多くやりすぎず10件程度にする)
     res = supabase.table("YouTubeMV_Japanese")\
         .select("video_id, title, description, thumbnail_url, channel_title")\
         .eq("is_analyzed", False)\
-        .limit(20).execute() # 一回の実行件数は任意に調整してください
+        .limit(10).execute()
 
     if not res.data:
         print("解析対象のデータがありません。")
         return
 
     for video in res.data:
+        video_id = video['video_id']
         print(f"\n🔍 解析中: {video['title']}")
         
         img_b64 = get_image_base64(video['thumbnail_url'])
         
         prompt = f"""
-        あなたは日本の音楽業界に精通したエージェントです。提供された動画情報、サムネイル画像、そしてGoogle検索を駆使して、正確なデータを抽出してください。
+        あなたは日本の音楽業界に精通した専門家です。以下の情報とGoogle検索を使い、正確なデータを抽出してください。
 
         【動画情報】
         タイトル: {video['title']}
         チャンネル名: {video['channel_title']}
-        概要欄: {video['description'][:1500]}
+        概要欄: {video['description'][:1000]}
 
         【抽出ルール】
-        1. singer_name: 歌手/ユニットの正式名称。略称（例：ミスチル）ではなく正式名（例：Mr.Children）にすること。
-        2. song_title: 純粋な曲名のみ。タイトルにある【MV】、Official Video、(Full Ver.)などの装飾記号や文言は徹底的に排除すること。
-        3. tie_up: この曲が使われたアニメ、映画、ドラマ、CM等の作品名。概要欄に無ければGoogle検索で特定すること。無ければ「なし」と記載。
-        4. is_official_mv: 以下の条件をすべて満たす場合のみ true。
-           - 投稿者が本人、所属レーベル、または公式作品チャンネルである。
-           - 動画内容がカバー、ライブ、Shorts、ダイジェスト、広告ではない「Music Video」本編であること。
+        1. singer_name: 歌手の正式名称。略称ではなく正式名にすること。
+        2. song_title: 純粋な曲名のみ。装飾記号や(Official Video)等は除去すること。
+        3. tie_up: タイアップ作品名（アニメ、ドラマ、映画、CM等）。無ければ「なし」。
+        4. is_official_mv: 本人・公式によるMusic Video本編ならtrue。それ以外（カバー、ライブ、Shorts等）はfalse。
         """
 
         try:
-            # Gemini API呼び出し (Grounding: Google検索有効)
             contents = [prompt]
             if img_b64:
                 contents.append(types.Part.from_bytes(data=base64.b64decode(img_b64), mime_type="image/jpeg"))
@@ -90,12 +88,20 @@ def analyze_videos():
                 "tie_up": result.tie_up,
                 "is_official_mv": result.is_official_mv,
                 "is_analyzed": True
-            }).eq("video_id", video['video_id']).execute()
+            }).eq("video_id", video_id).execute()
             
-            print(f"✅ 解析完了: {result.singer_name} - {result.song_title} (Official: {result.is_official_mv})")
+            print(f"✅ 解析完了: {result.singer_name} - {result.song_title}")
+            
+            # レートリミット回避のための待機 (15秒)
+            print("⏳ 15秒待機します...")
+            time.sleep(15)
 
         except Exception as e:
-            print(f"❌ 解析エラー ({video['video_id']}): {e}")
+            if "429" in str(e):
+                print("⚠️ レートリミット到達。60秒停止します...")
+                time.sleep(60)
+            else:
+                print(f"❌ 解析エラー ({video_id}): {e}")
 
 if __name__ == "__main__":
     analyze_videos()

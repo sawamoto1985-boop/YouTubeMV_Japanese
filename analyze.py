@@ -12,9 +12,9 @@ GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
 
 # 初期化
 supabase = create_client(SB_URL, SB_KEY)
+
+# 【重要】無料枠のAPIキーで404を回避するための設定
 genai.configure(api_key=GEMINI_KEY)
-# モデルをここで定義
-model = genai.GenerativeModel('gemini-1.5-flash')
 
 def extract_json(text):
     try:
@@ -23,7 +23,7 @@ def extract_json(text):
         return json.loads(text)
     except: return None
 
-def analyze_and_filter(limit=5): # まずは5件でテスト
+def analyze_and_filter(limit=5):
     res = supabase.table("YouTubeMV_Japanese") \
         .select("video_id, thumbnail_url, title, channel_title") \
         .eq("is_analyzed", False) \
@@ -36,6 +36,9 @@ def analyze_and_filter(limit=5): # まずは5件でテスト
         print("✅ 解析待ちの動画はありません。")
         return
 
+    # 【重要】モデル名をフルパス「models/gemini-1.5-flash」に固定
+    model = genai.GenerativeModel(model_name='models/gemini-1.5-flash')
+
     for v in videos:
         print(f"🧐 判定中: {v['title']}")
         try:
@@ -44,11 +47,11 @@ def analyze_and_filter(limit=5): # まずは5件でテスト
             prompt = (
                 f"動画タイトル: {v['title']}\n"
                 f"チャンネル名: {v['channel_title']}\n\n"
-                "指示: アーティスト公式のMusic Videoなら true、それ以外（リアクション、歌ってみた、ライブ、切り抜き）は false。\n"
+                "指示: アーティスト公式のMusic Videoなら true、それ以外は false。\n"
                 "JSON形式で回答: {\"is_official\": boolean, \"tags\": [\"#タグ1\"]}"
             )
 
-            # 最もシンプルな画像＋テキスト送信
+            # 解析実行
             response = model.generate_content([
                 prompt,
                 {'mime_type': 'image/jpeg', 'data': img_data}
@@ -62,12 +65,14 @@ def analyze_and_filter(limit=5): # まずは5件でテスト
                     "ai_tags": result.get("tags", []),
                     "is_analyzed": True
                 }).eq("video_id", v['video_id']).execute()
-                print(f"  > 結果: {result.get('is_official')}")
+                status = "✅ 採用" if result.get("is_official") else "❌ 却下"
+                print(f"  > {status}")
             else:
-                print(f"  ⚠️ 解析失敗")
+                print(f"  ⚠️ JSON解析失敗")
 
         except Exception as e:
-            print(f"  ⚠️ エラー: {str(e)}")
+            # ここで詳細なエラーを出して原因を完全に特定します
+            print(f"  ⚠️ エラー詳細: {str(e)}")
 
 if __name__ == "__main__":
     analyze_and_filter(5)

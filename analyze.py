@@ -3,17 +3,18 @@ import requests
 import json
 import re
 from supabase import create_client
-from google import genai  # 最新のライブラリ
+import google.generativeai as genai
 
 # 環境変数
 SB_URL = os.environ.get("SUPABASE_URL")
 SB_KEY = os.environ.get("SUPABASE_ANON_KEY")
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
 
-# クライアント初期化
+# 初期化
 supabase = create_client(SB_URL, SB_KEY)
-# 余計なオプションを付けず、APIキーのみで初期化
-client = genai.Client(api_key=GEMINI_KEY)
+genai.configure(api_key=GEMINI_KEY)
+# モデルをここで定義
+model = genai.GenerativeModel('gemini-1.5-flash')
 
 def extract_json(text):
     try:
@@ -22,7 +23,7 @@ def extract_json(text):
         return json.loads(text)
     except: return None
 
-def analyze_and_filter(limit=10):
+def analyze_and_filter(limit=5): # まずは5件でテスト
     res = supabase.table("YouTubeMV_Japanese") \
         .select("video_id, thumbnail_url, title, channel_title") \
         .eq("is_analyzed", False) \
@@ -36,21 +37,22 @@ def analyze_and_filter(limit=10):
         return
 
     for v in videos:
-        print(f"🧐 判定・解析中: {v['title']}")
+        print(f"🧐 判定中: {v['title']}")
         try:
-            img_res = requests.get(v['thumbnail_url'])
-            img_data = img_res.content
+            img_data = requests.get(v['thumbnail_url']).content
             
-            prompt = f"動画タイトル: {v['title']}\nチャンネル名: {v['channel_title']}\n\n指示: 1. アーティスト公式MVなら true、それ以外は false。 2. 公式MVの場合のみタグを5つ生成。 JSON形式のみで回答: {{ \"is_official\": boolean, \"reason\": \"string\", \"tags\": [\"string\"] }}"
-
-            # 最新SDKの標準的な書き方
-            response = client.models.generate_content(
-                model="gemini-1.5-flash",
-                contents=[
-                    prompt,
-                    genai.types.Part.from_bytes(data=img_data, mime_type="image/jpeg")
-                ]
+            prompt = (
+                f"動画タイトル: {v['title']}\n"
+                f"チャンネル名: {v['channel_title']}\n\n"
+                "指示: アーティスト公式のMusic Videoなら true、それ以外（リアクション、歌ってみた、ライブ、切り抜き）は false。\n"
+                "JSON形式で回答: {\"is_official\": boolean, \"tags\": [\"#タグ1\"]}"
             )
+
+            # 最もシンプルな画像＋テキスト送信
+            response = model.generate_content([
+                prompt,
+                {'mime_type': 'image/jpeg', 'data': img_data}
+            ])
             
             result = extract_json(response.text)
 
@@ -60,14 +62,12 @@ def analyze_and_filter(limit=10):
                     "ai_tags": result.get("tags", []),
                     "is_analyzed": True
                 }).eq("video_id", v['video_id']).execute()
-                
-                status = "✅ 採用" if result.get("is_official") else "❌ 却下"
-                print(f"  > {status}: {result.get('reason')}")
+                print(f"  > 結果: {result.get('is_official')}")
             else:
-                print(f"  ⚠️ 解析失敗: {response.text}")
+                print(f"  ⚠️ 解析失敗")
 
         except Exception as e:
             print(f"  ⚠️ エラー: {str(e)}")
 
 if __name__ == "__main__":
-    analyze_and_filter(10)
+    analyze_and_filter(5)

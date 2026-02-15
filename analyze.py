@@ -3,7 +3,7 @@ import requests
 import json
 import re
 from supabase import create_client
-from google import genai
+import google.generativeai as genai  # 元のライブラリに戻す
 
 # 環境変数
 SB_URL = os.environ.get("SUPABASE_URL")
@@ -13,8 +13,8 @@ GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
 # クライアント初期化
 supabase = create_client(SB_URL, SB_KEY)
 
-# 無料枠のキーの場合、余計な設定をせず初期化するのがコツです
-client = genai.Client(api_key=GEMINI_KEY)
+# 【重要】ここがポイントです。404を避けるための強制設定
+genai.configure(api_key=GEMINI_KEY, transport="rest") # REST通信を強制
 
 def extract_json(text):
     try:
@@ -38,6 +38,9 @@ def analyze_and_filter(limit=10):
         print("✅ 解析待ちの動画はありません。")
         return
 
+    # モデルの定義（パスを完全固定）
+    model = genai.GenerativeModel('gemini-1.5-flash')
+
     for v in videos:
         print(f"🧐 判定・解析中: {v['title']}")
         
@@ -45,27 +48,13 @@ def analyze_and_filter(limit=10):
             img_res = requests.get(v['thumbnail_url'])
             img_data = img_res.content
             
-            prompt = f"""
-            動画タイトル: {v['title']}
-            チャンネル名: {v['channel_title']}
-            
-            指示:
-            1. 「アーティスト本人/レーベル公式のMusic Video」なら true、それ以外（リアクション、歌ってみた、ライブ、切り抜き）は false。
-            2. 公式MVの場合のみ、色、季節、時間帯、雰囲気を5つのハッシュタグで。
-            
-            JSON形式のみで回答:
-            {{ "is_official": boolean, "reason": "15文字以内", "tags": ["#タグ1", "#タグ2", "#タグ3", "#タグ4", "#タグ5"] }}
-            """
+            prompt = f"動画タイトル: {v['title']}\nチャンネル名: {v['channel_title']}\n\n指示: 1. アーティスト公式MVなら true、それ以外は false。 2. 公式MVの場合のみ、タグを5つ生成。 JSON形式のみで回答: {{ \"is_official\": boolean, \"reason\": \"string\", \"tags\": [\"string\"] }}"
 
-            # 【重要】モデル名を gemini-1.5-flash に固定
-            # 無料プロジェクトの場合、この指定が最も安定します
-            response = client.models.generate_content(
-                model="gemini-1.5-flash",
-                contents=[
-                    prompt,
-                    genai.types.Part.from_bytes(data=img_data, mime_type="image/jpeg")
-                ]
-            )
+            # 旧ライブラリの形式で送信
+            response = model.generate_content([
+                prompt,
+                {'mime_type': 'image/jpeg', 'data': img_data}
+            ])
             
             result = extract_json(response.text)
 
@@ -75,14 +64,11 @@ def analyze_and_filter(limit=10):
                     "ai_tags": result.get("tags", []),
                     "is_analyzed": True
                 }).eq("video_id", v['video_id']).execute()
-                
-                status = "✅ 採用" if result.get("is_official") else "❌ 却下"
-                print(f"  > {status} | 理由: {result.get('reason')}")
+                print(f"  > ✅ 完了: {result.get('reason')}")
             else:
                 print(f"  ⚠️ JSON解析失敗")
 
         except Exception as e:
-            # 404が出る場合はここにエラー内容が出ます
             print(f"  ⚠️ エラー詳細: {str(e)}")
 
 if __name__ == "__main__":

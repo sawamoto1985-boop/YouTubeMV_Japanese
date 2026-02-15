@@ -1,0 +1,2 @@
+supabase
+google-api-python-client

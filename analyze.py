@@ -3,6 +3,7 @@ import requests
 import json
 import base64
 import re
+import time
 from supabase import create_client
 
 # 環境変数
@@ -10,7 +11,6 @@ SB_URL = os.environ.get("SUPABASE_URL")
 SB_KEY = os.environ.get("SUPABASE_ANON_KEY")
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
 
-# Supabase初期化
 supabase = create_client(SB_URL, SB_KEY)
 
 def extract_json(text):
@@ -20,8 +20,14 @@ def extract_json(text):
     except:
         return None
 
-def analyze_and_filter(limit=5):
-    print(f"📋 未解析の動画を {limit} 件取得します...")
+def analyze_batch(limit=10):
+    """
+    未解析データを指定件数だけ処理する関数
+    処理した件数を返します（0なら完了）
+    """
+    print(f"📋 未解析データの検索中...（{limit}件ずつ）")
+    
+    # 👇 ここが「判定済みを除外する」最強のフィルターです
     res = supabase.table("YouTubeMV_Japanese") \
         .select("video_id, thumbnail_url, title, channel_title") \
         .eq("is_analyzed", False) \
@@ -31,22 +37,19 @@ def analyze_and_filter(limit=5):
 
     videos = res.data
     if not videos:
-        print("✅ 解析待ちの動画はありません。")
-        return
+        return 0  # もう未解析データはない
 
-    # 【重要】リストにあった最新モデル「gemini-2.5-flash」を指定
+    # 最新モデルを指定（Gemini 2.5 Flash）
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_KEY}"
     headers = {'Content-Type': 'application/json'}
 
-    for v in videos:
-        print(f"🧐 解析中: {v['title']}")
+    for i, v in enumerate(videos):
+        print(f"   [{i+1}/{len(videos)}] 🧐 {v['title']}")
         
         try:
-            # 画像ダウンロード & Base64変換
             img_data = requests.get(v['thumbnail_url']).content
             b64_img = base64.b64encode(img_data).decode('utf-8')
 
-            # プロンプト
             prompt = (
                 f"動画タイトル: {v['title']}\n"
                 f"チャンネル名: {v['channel_title']}\n\n"
@@ -57,7 +60,6 @@ def analyze_and_filter(limit=5):
                 "{\"is_official\": boolean, \"reason\": \"理由を短く\", \"tags\": [\"#雰囲気タグ1\", \"#タグ2\"]}"
             )
 
-            # データ作成
             payload = {
                 "contents": [{
                     "parts": [
@@ -67,34 +69,49 @@ def analyze_and_filter(limit=5):
                 }]
             }
 
-            # APIリクエスト
             response = requests.post(url, headers=headers, json=payload)
             result = response.json()
 
             if "error" in result:
-                print(f"  ❌ APIエラー: {result['error']['message']}")
+                print(f"      ❌ APIエラー: {result['error']['message']}")
+                time.sleep(5)
                 continue
 
             # 結果保存
-            ai_text = result['candidates'][0]['content']['parts'][0]['text']
-            json_data = extract_json(ai_text)
-            
-            if json_data:
-                is_official = json_data.get("is_official", False)
-                tags = json_data.get("tags", [])
+            if 'candidates' in result:
+                ai_text = result['candidates'][0]['content']['parts'][0]['text']
+                json_data = extract_json(ai_text)
                 
-                supabase.table("YouTubeMV_Japanese").update({
-                    "is_official_mv": is_official,
-                    "ai_tags": tags,
-                    "is_analyzed": True
-                }).eq("video_id", v['video_id']).execute()
+                if json_data:
+                    # ここで is_analyzed を True にすることで、次回の対象から外れます
+                    supabase.table("YouTubeMV_Japanese").update({
+                        "is_official_mv": json_data.get("is_official", False),
+                        "ai_tags": json_data.get("tags", []),
+                        "is_analyzed": True 
+                    }).eq("video_id", v['video_id']).execute()
 
-                print(f"  > 判定: {'✅ 公式' if is_official else '❌ 対象外'}")
+                    print(f"      > 判定: {'✅ 公式' if json_data.get('is_official') else '❌ 対象外'}")
+                else:
+                    print(f"      ⚠️ JSON解析失敗")
             else:
-                print(f"  ⚠️ JSON解析失敗: {ai_text[:50]}...")
+                print(f"      ⚠️ 想定外のエラー: {result}")
 
         except Exception as e:
-            print(f"  ⚠️ システムエラー: {e}")
+            print(f"      ⚠️ システムエラー: {e}")
+
+        # API制限回避のための休憩
+        time.sleep(4)
+    
+    return len(videos)
 
 if __name__ == "__main__":
-    analyze_and_filter(5)
+    # 🔁 全データが終わるまで無限ループで回す設定
+    total_processed = 0
+    while True:
+        count = analyze_batch(10) # 10件ずつ確実に進める
+        if count == 0:
+            print("\n🎉 すべての解析が完了しました！未解析データはもうありません。")
+            break
+        total_processed += count
+        print(f"🍵 休憩中... (これまでの合計処理数: {total_processed}件)\n")
+        time.sleep(10) # バッチ間の長めの休憩

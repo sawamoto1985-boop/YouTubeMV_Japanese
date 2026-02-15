@@ -4,6 +4,7 @@ import json
 import re
 from supabase import create_client
 import google.generativeai as genai
+from google.generativeai.types import RequestOptions # これを追加
 
 # 環境変数
 SB_URL = os.environ.get("SUPABASE_URL")
@@ -11,7 +12,12 @@ SB_KEY = os.environ.get("SUPABASE_ANON_KEY")
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
 
 supabase = create_client(SB_URL, SB_KEY)
-genai.configure(api_key=GEMINI_KEY)
+
+# 【重要】無料版APIキー専用の設定（v1窓口を強制指定）
+genai.configure(
+    api_key=GEMINI_KEY,
+    client_options={"api_version": "v1"} 
+)
 
 def extract_json(text):
     try:
@@ -33,8 +39,8 @@ def analyze_and_filter(limit=10):
         print("✅ 解析待ちの動画はありません。")
         return
 
-    # 【重要】ここを latest に変えることで、404エラー（モデル未発見）を強制回避します
-    model = genai.GenerativeModel('models/gemini-1.5-flash-latest')
+    # モデル名からプレフィックスを除去
+    model = genai.GenerativeModel('gemini-1.5-flash')
 
     for v in videos:
         print(f"🧐 判定・解析中: {v['title']}")
@@ -42,12 +48,13 @@ def analyze_and_filter(limit=10):
             img_res = requests.get(v['thumbnail_url'])
             img_data = img_res.content
             
-            prompt = f"動画タイトル: {v['title']}\nチャンネル名: {v['channel_title']}\n\n指示: 1. アーティスト公式MVなら true、それ以外は false。 2. 公式MVの場合のみ、タグを5つ生成。 JSON形式のみで回答: {{ \"is_official\": boolean, \"reason\": \"string\", \"tags\": [\"string\"] }}"
+            prompt = f"動画タイトル: {v['title']}\nチャンネル名: {v['channel_title']}\n\n指示: 1. アーティスト公式MVなら true、それ以外は false。 2. 公式MVの場合のみ、タグを5つ。 JSON形式: {{ \"is_official\": boolean, \"reason\": \"string\", \"tags\": [\"string\"] }}"
 
-            response = model.generate_content([
-                prompt,
-                {'mime_type': 'image/jpeg', 'data': img_data}
-            ])
+            # 通信設定を最新に固定してリクエスト
+            response = model.generate_content(
+                [prompt, {'mime_type': 'image/jpeg', 'data': img_data}],
+                request_options=RequestOptions(api_version="v1")
+            )
             
             result = extract_json(response.text)
 

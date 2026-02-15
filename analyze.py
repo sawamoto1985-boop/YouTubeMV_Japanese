@@ -2,25 +2,22 @@ import os
 import requests
 import json
 import re
+import base64
 from supabase import create_client
-import google.generativeai as genai
 
 # 環境変数
 SB_URL = os.environ.get("SUPABASE_URL")
 SB_KEY = os.environ.get("SUPABASE_ANON_KEY")
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
 
-# 初期化
+# Supabase初期化
 supabase = create_client(SB_URL, SB_KEY)
-
-# 【重要】無料枠のAPIキーで404を回避するための設定
-genai.configure(api_key=GEMINI_KEY)
 
 def extract_json(text):
     try:
         match = re.search(r'\{.*\}', text, re.DOTALL)
         if match: return json.loads(match.group())
-        return json.loads(text)
+        return None
     except: return None
 
 def analyze_and_filter(limit=5):
@@ -36,28 +33,32 @@ def analyze_and_filter(limit=5):
         print("✅ 解析待ちの動画はありません。")
         return
 
-    # 【重要】モデル名をフルパス「models/gemini-1.5-flash」に固定
-    model = genai.GenerativeModel(model_name='models/gemini-1.5-flash')
+    # APIの窓口（v1の安定版を直叩き）
+    api_url = f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key={GEMINI_KEY}"
 
     for v in videos:
         print(f"🧐 判定中: {v['title']}")
         try:
-            img_data = requests.get(v['thumbnail_url']).content
+            # 画像をダウンロードしてBase64変換
+            img_data = base64.b64encode(requests.get(v['thumbnail_url']).content).decode('utf-8')
             
-            prompt = (
-                f"動画タイトル: {v['title']}\n"
-                f"チャンネル名: {v['channel_title']}\n\n"
-                "指示: アーティスト公式のMusic Videoなら true、それ以外は false。\n"
-                "JSON形式で回答: {\"is_official\": boolean, \"tags\": [\"#タグ1\"]}"
-            )
+            # 直接APIに送るデータ（JSON）を作成
+            payload = {
+                "contents": [{
+                    "parts": [
+                        {"text": f"動画タイトル: {v['title']}\nチャンネル名: {v['channel_title']}\n指示: アーティスト公式のMusic Videoなら true、それ以外は false。JSON形式のみで回答: {{\"is_official\": boolean, \"tags\": [\"#タグ1\"]}}"},
+                        {"inline_data": {"mime_type": "image/jpeg", "data": img_data}}
+                    ]
+                }]
+            }
 
-            # 解析実行
-            response = model.generate_content([
-                prompt,
-                {'mime_type': 'image/jpeg', 'data': img_data}
-            ])
-            
-            result = extract_json(response.text)
+            # API実行
+            response = requests.post(api_url, json=payload, headers={'Content-Type': 'application/json'})
+            resp_json = response.json()
+
+            # AIの回答テキストを取り出す
+            ai_text = resp_json['candidates'][0]['content']['parts'][0]['text']
+            result = extract_json(ai_text)
 
             if result:
                 supabase.table("YouTubeMV_Japanese").update({
@@ -68,11 +69,11 @@ def analyze_and_filter(limit=5):
                 status = "✅ 採用" if result.get("is_official") else "❌ 却下"
                 print(f"  > {status}")
             else:
-                print(f"  ⚠️ JSON解析失敗")
+                print(f"  ⚠️ 解析失敗: {ai_text}")
 
         except Exception as e:
-            # ここで詳細なエラーを出して原因を完全に特定します
             print(f"  ⚠️ エラー詳細: {str(e)}")
+            if 'resp_json' in locals(): print(f"  ⚠️ APIレスポンス: {resp_json}")
 
 if __name__ == "__main__":
     analyze_and_filter(5)

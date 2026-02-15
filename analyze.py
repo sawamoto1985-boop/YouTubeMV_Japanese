@@ -15,20 +15,18 @@ client = genai.Client(api_key=GEMINI_API_KEY)
 supabase = create_client(SB_URL, SB_KEY)
 
 def get_image_base64(url):
-    """サムネイル画像をURLから取得してBase64に変換"""
     try:
         resp = httpx.get(url, timeout=10.0)
         return base64.b64encode(resp.content).decode("utf-8")
-    except Exception as e:
-        print(f"  ⚠️ 画像取得失敗: {e}")
+    except:
         return None
 
 def analyze_videos():
-    # 未解析データを取得 (一度に多くやりすぎず10件程度にする)
+    # 件数を5件に絞り、確実に1つずつ終わらせる
     res = supabase.table("YouTubeMV_Japanese")\
         .select("video_id, title, description, thumbnail_url, channel_title")\
         .eq("is_analyzed", False)\
-        .limit(10).execute()
+        .limit(5).execute()
 
     if not res.data:
         print("解析対象のデータがありません。")
@@ -36,23 +34,21 @@ def analyze_videos():
 
     for video in res.data:
         video_id = video['video_id']
-        print(f"\n🔍 解析中: {video['title']}")
+        print(f"\n🔍 解析開始: {video['title']}")
         
         img_b64 = get_image_base64(video['thumbnail_url'])
         
+        # プロンプトの簡略化（負荷軽減）
         prompt = f"""
-        あなたは日本の音楽業界に精通した専門家です。以下の情報とGoogle検索を使い、正確なデータを抽出してください。
-
-        【動画情報】
+        日本の音楽情報の特定。
         タイトル: {video['title']}
-        チャンネル名: {video['channel_title']}
-        概要欄: {video['description'][:1000]}
+        チャンネル: {video['channel_title']}
+        概要欄: {video['description'][:800]}
 
-        【抽出ルール】
-        1. singer_name: 歌手の正式名称。略称ではなく正式名にすること。
-        2. song_title: 純粋な曲名のみ。装飾記号や(Official Video)等は除去すること。
-        3. tie_up: タイアップ作品名（アニメ、ドラマ、映画、CM等）。無ければ「なし」。
-        4. is_official_mv: 本人・公式によるMusic Video本編ならtrue。それ以外（カバー、ライブ、Shorts等）はfalse。
+        1. singer_name: 正式な歌手名
+        2. song_title: 純粋な曲名
+        3. tie_up: 作品名（不明なら「なし」）
+        4. is_official_mv: 公式MVならtrue
         """
 
         try:
@@ -60,11 +56,13 @@ def analyze_videos():
             if img_b64:
                 contents.append(types.Part.from_bytes(data=base64.b64decode(img_b64), mime_type="image/jpeg"))
 
+            # 最初はGoogle検索なしで試行（リミット対策）
             response = client.models.generate_content(
                 model="gemini-2.0-flash",
                 contents=contents,
                 config=types.GenerateContentConfig(
-                    tools=[types.Tool(google_search_retrieval=types.GoogleSearchRetrieval())],
+                    # 検索が必要な場合のみ有効にするように調整（ここでは一旦OFFで安定化）
+                    # tools=[types.Tool(google_search_retrieval=types.GoogleSearchRetrieval())], 
                     response_mime_type="application/json",
                     response_schema={
                         "type": "object",
@@ -80,8 +78,6 @@ def analyze_videos():
             )
 
             result = response.parsed
-
-            # DBへ反映
             supabase.table("YouTubeMV_Japanese").update({
                 "singer_name": result.singer_name,
                 "song_title": result.song_title,
@@ -90,18 +86,18 @@ def analyze_videos():
                 "is_analyzed": True
             }).eq("video_id", video_id).execute()
             
-            print(f"✅ 解析完了: {result.singer_name} - {result.song_title}")
-            
-            # レートリミット回避のための待機 (15秒)
-            print("⏳ 15秒待機します...")
-            time.sleep(15)
+            print(f"✅ 解析成功: {result.singer_name}")
+            print("⏳ 冷却期間 (30秒待機)...")
+            time.sleep(30)
 
         except Exception as e:
             if "429" in str(e):
-                print("⚠️ レートリミット到達。60秒停止します...")
-                time.sleep(60)
+                print("⚠️ 強力なレート制限。今回の実行を終了します。")
+                break 
             else:
-                print(f"❌ 解析エラー ({video_id}): {e}")
+                print(f"❌ エラー: {e}")
+                # エラーが出たものは一旦スキップして次に進めるよう、フラグだけ変えるか検討
+                time.sleep(10)
 
 if __name__ == "__main__":
     analyze_videos()

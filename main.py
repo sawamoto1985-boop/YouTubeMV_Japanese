@@ -1,99 +1,86 @@
 import os
-import requests
-import json
-import re
-import base64
+import time
+from datetime import datetime
+from googleapiclient.discovery import build
 from supabase import create_client
 
-# --- 設定（GitHub Secretsから取得） ---
+# --- 設定 ---
+YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY")
 SB_URL = os.environ.get("SUPABASE_URL")
 SB_KEY = os.environ.get("SUPABASE_ANON_KEY")
-GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
 
-# Supabaseクライアント初期化
+youtube = build("youtube", "v3", developerKey=YOUTUBE_API_KEY)
 supabase = create_client(SB_URL, SB_KEY)
 
-def extract_json(text):
-    """AIの回答からJSON部分のみを抽出する"""
-    try:
-        match = re.search(r'\{.*\}', text, re.DOTALL)
-        if match:
-            return json.loads(match.group())
-        return None
-    except Exception:
-        return None
-
-def analyze_and_filter(limit=5):
-    # 解析待ちの動画を再生数順に取得
-    res = supabase.table("YouTubeMV_Japanese") \
-        .select("video_id, thumbnail_url, title, channel_title") \
-        .eq("is_analyzed", False) \
-        .order("view_count", desc=True) \
-        .limit(limit) \
-        .execute()
-
-    videos = res.data
-    if not videos:
-        print("✅ 解析待ちの動画はありません。")
-        return
-
-    # 【2026年最新】無料枠の404エラーを回避するエンドポイント（v1beta）
-    api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_KEY}"
-
-    for v in videos:
-        print(f"🧐 判定・解析中: {v['title']}")
-        try:
-            # 1. サムネイル画像をダウンロードしてBase64に変換
-            img_response = requests.get(v['thumbnail_url'])
-            img_base64 = base64.b64encode(img_response.content).decode('utf-8')
+def fetch_yearly_mvs(year, count_limit=100):
+    print(f"📅 {year}年のMVを収集しています...")
+    
+    start_time = f"{year}-01-01T00:00:00Z"
+    end_time = f"{year}-12-31T23:59:59Z"
+    
+    # 除外ワードを徹底して精度を上げる
+    query = "official MV -cover -歌ってみた -reaction -切り抜き -LIVE -カラオケ"
+    
+    videos = []
+    next_page_token = None
+    
+    # 50件ずつ、最大2回ループ（合計100件）
+    while len(videos) < count_limit:
+        search_response = youtube.search().list(
+            q=query,
+            part="snippet",
+            maxResults=min(50, count_limit - len(videos)),
+            type="video",
+            videoCategoryId="10",      # Musicカテゴリ固定
+            relevanceLanguage="ja",    # 日本語
+            regionCode="JP",           # 日本
+            publishedAfter=start_time,
+            publishedBefore=end_time,
+            order="viewCount",         # 再生数順
+            pageToken=next_page_token
+        ).execute()
+        
+        for item in search_response['items']:
+            v_id = item['id']['videoId']
+            snippet = item['snippet']
             
-            # 2. AIへの指示（プロンプト）
-            prompt = (
-                f"動画タイトル: {v['title']}\n"
-                f"チャンネル名: {v['channel_title']}\n\n"
-                "指示:\n"
-                "1. アーティスト本人の公式MVなら true、それ以外（ライブ、カバー、リアクション、切り抜き）は false。\n"
-                "2. 公式MVの場合、雰囲気や色を表すタグを5つ生成。\n"
-                "必ず以下のJSON形式のみで回答してください:\n"
-                "{\"is_official\": boolean, \"reason\": \"string\", \"tags\": [\"string\"]}"
-            )
+            videos.append({
+                "video_id": v_id,
+                "title": snippet['title'],
+                "channel_title": snippet['channelTitle'],
+                "thumbnail_url": snippet['thumbnails']['high']['url'],
+                "published_at": snippet['publishedAt'],
+                "view_count": 0, # 後で更新するか、とりあえず0
+                "is_analyzed": False # これが重要（Gemini判定に回すため）
+            })
+            
+        next_page_token = search_response.get('nextPageToken')
+        if not next_page_token:
+            break
+            
+    return videos
 
-            # 3. APIリクエスト送信
-            payload = {
-                "contents": [{
-                    "parts": [
-                        {"text": prompt},
-                        {"inline_data": {"mime_type": "image/jpeg", "data": img_base64}}
-                    ]
-                }]
-            }
-
-            response = requests.post(api_url, json=payload, headers={'Content-Type': 'application/json'})
-            resp_data = response.json()
-
-            # APIエラーチェック
-            if 'error' in resp_data:
-                print(f"  ❌ APIエラー: {resp_data['error']['message']}")
-                continue
-
-            # 4. 回答の解析とSupabaseの更新
-            ai_text = resp_data['candidates'][0]['content']['parts'][0]['text']
-            result = extract_json(ai_text)
-
-            if result:
-                supabase.table("YouTubeMV_Japanese").update({
-                    "is_official_mv": result.get("is_official", True),
-                    "ai_tags": result.get("tags", []),
-                    "is_analyzed": True
-                }).eq("video_id", v['video_id']).execute()
-                
-                status = "✅ 採用" if result.get("is_official") else "❌ 却下"
-                print(f"  > {status} | 理由: {result.get('reason')}")
-            else:
-                print(f"  ⚠️ JSON解析失敗: {ai_text[:50]}...")
-
-        except Exception as e:
-            print(f"  ⚠️ 実行エラー: {str(e)}")
+def save_to_supabase(videos):
+    new_count = 0
+    for v in videos:
+        # 重複チェック（video_idが既にあるか）
+        check = supabase.table("YouTubeMV_Japanese").select("video_id").eq("video_id", v["video_id"]).execute()
+        
+        if not check.data:
+            supabase.table("YouTubeMV_Japanese").insert(v).execute()
+            new_count += 1
+            
+    print(f"  ✅ {new_count} 件の新しい動画を保存しました。")
 
 if __name__ == "__main__":
-    analyze_and_filter(5)
+    current_year = datetime.now().year
+    # 2011年（15年前）から今年までループ
+    for year in range(2011, current_year + 1):
+        try:
+            yearly_videos = fetch_yearly_mvs(year, 100)
+            save_to_supabase(yearly_videos)
+            time.sleep(2) # API制限に優しく
+        except Exception as e:
+            print(f"  ❌ {year}年の収集に失敗しました: {e}")
+
+    print("\n🎉 全年代の収集作業が完了しました！次は analyze.py を動かしてAI判定をしてください。")

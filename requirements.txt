@@ -1,4 +1,2 @@
-google-api-python-client
-supabase
 requests
-google-generativeai
+supabase

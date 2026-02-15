@@ -2,6 +2,7 @@ import os
 import base64
 import httpx
 import time
+import random
 from google import genai
 from google.genai import types
 from supabase import create_client
@@ -18,37 +19,40 @@ def get_image_base64(url):
     try:
         resp = httpx.get(url, timeout=10.0)
         return base64.b64encode(resp.content).decode("utf-8")
-    except:
-        return None
+    except: return None
 
 def analyze_videos():
-    # 件数を5件に絞り、確実に1つずつ終わらせる
+    # 未解析データを取得 (ランダムに取得して同じ箇所でのループを防ぐ)
     res = supabase.table("YouTubeMV_Japanese")\
         .select("video_id, title, description, thumbnail_url, channel_title")\
         .eq("is_analyzed", False)\
-        .limit(5).execute()
+        .limit(20).execute()
 
     if not res.data:
         print("解析対象のデータがありません。")
         return
 
-    for video in res.data:
+    # 取得したリストをシャッフル
+    videos = res.data
+    random.shuffle(videos)
+
+    # 1回の実行で最大5件だけ処理（無料枠の安全策）
+    for video in videos[:5]:
         video_id = video['video_id']
         print(f"\n🔍 解析開始: {video['title']}")
         
         img_b64 = get_image_base64(video['thumbnail_url'])
         
-        # プロンプトの簡略化（負荷軽減）
         prompt = f"""
-        日本の音楽情報の特定。
+        日本の音楽情報の特定。Google検索を使用して正確な情報を回答してください。
         タイトル: {video['title']}
         チャンネル: {video['channel_title']}
         概要欄: {video['description'][:800]}
 
-        1. singer_name: 正式な歌手名
-        2. song_title: 純粋な曲名
-        3. tie_up: 作品名（不明なら「なし」）
-        4. is_official_mv: 公式MVならtrue
+        1. singer_name: 歌手の正式名称（検索で裏取りすること）
+        2. song_title: 純粋な曲名（装飾除去）
+        3. tie_up: 作品名（アニメ/ドラマ/映画/CM等。検索で特定すること。無ければ「なし」）
+        4. is_official_mv: 公式MV本編ならtrue
         """
 
         try:
@@ -56,13 +60,12 @@ def analyze_videos():
             if img_b64:
                 contents.append(types.Part.from_bytes(data=base64.b64decode(img_b64), mime_type="image/jpeg"))
 
-            # 最初はGoogle検索なしで試行（リミット対策）
+            # Google検索を有効にして実行
             response = client.models.generate_content(
                 model="gemini-2.0-flash",
                 contents=contents,
                 config=types.GenerateContentConfig(
-                    # 検索が必要な場合のみ有効にするように調整（ここでは一旦OFFで安定化）
-                    # tools=[types.Tool(google_search_retrieval=types.GoogleSearchRetrieval())], 
+                    tools=[types.Tool(google_search_retrieval=types.GoogleSearchRetrieval())], 
                     response_mime_type="application/json",
                     response_schema={
                         "type": "object",
@@ -86,18 +89,18 @@ def analyze_videos():
                 "is_analyzed": True
             }).eq("video_id", video_id).execute()
             
-            print(f"✅ 解析成功: {result.singer_name}")
-            print("⏳ 冷却期間 (30秒待機)...")
+            print(f"✅ 解析成功: {result.singer_name} - {result.song_title}")
+            print("⏳ 30秒待機（クォータ保護）...")
             time.sleep(30)
 
         except Exception as e:
             if "429" in str(e):
-                print("⚠️ 強力なレート制限。今回の実行を終了します。")
-                break 
+                print("⚠️ 現在、Gemini APIの無料枠制限(limit: 0)にかかっています。")
+                print("数時間〜1日置いてから再実行してください。")
+                return # 429が出たら即終了してActionsを止める
             else:
                 print(f"❌ エラー: {e}")
-                # エラーが出たものは一旦スキップして次に進めるよう、フラグだけ変えるか検討
-                time.sleep(10)
+                time.sleep(5)
 
 if __name__ == "__main__":
     analyze_videos()

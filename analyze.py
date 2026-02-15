@@ -12,6 +12,8 @@ GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
 
 # クライアント初期化
 supabase = create_client(SB_URL, SB_KEY)
+
+# 無料枠のキーの場合、余計な設定をせず初期化するのがコツです
 client = genai.Client(api_key=GEMINI_KEY)
 
 def extract_json(text):
@@ -24,7 +26,6 @@ def extract_json(text):
         return None
 
 def analyze_and_filter(limit=10):
-    # 再生数順に未解析データを取得
     res = supabase.table("YouTubeMV_Japanese") \
         .select("video_id, thumbnail_url, title, channel_title") \
         .eq("is_analyzed", False) \
@@ -56,9 +57,10 @@ def analyze_and_filter(limit=10):
             {{ "is_official": boolean, "reason": "15文字以内", "tags": ["#タグ1", "#タグ2", "#タグ3", "#タグ4", "#タグ5"] }}
             """
 
-            # モデル名を最新版に固定して実行
+            # 【重要】モデル名を gemini-1.5-flash に固定
+            # 無料プロジェクトの場合、この指定が最も安定します
             response = client.models.generate_content(
-                model="gemini-1.5-flash", 
+                model="gemini-1.5-flash",
                 contents=[
                     prompt,
                     genai.types.Part.from_bytes(data=img_data, mime_type="image/jpeg")
@@ -77,10 +79,11 @@ def analyze_and_filter(limit=10):
                 status = "✅ 採用" if result.get("is_official") else "❌ 却下"
                 print(f"  > {status} | 理由: {result.get('reason')}")
             else:
-                print(f"  ⚠️ JSON解析失敗: {response.text}")
+                print(f"  ⚠️ JSON解析失敗")
 
         except Exception as e:
-            print(f"  ⚠️ エラー: {str(e)}")
+            # 404が出る場合はここにエラー内容が出ます
+            print(f"  ⚠️ エラー詳細: {str(e)}")
 
 if __name__ == "__main__":
     analyze_and_filter(10)

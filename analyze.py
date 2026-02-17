@@ -14,26 +14,24 @@ groq_client = Groq(api_key=GROQ_API_KEY)
 supabase = create_client(SB_URL, SB_KEY)
 
 def analyze_videos():
-    # 取得件数を20件に増量
+    # 100件取得
     res = supabase.table("YouTubeMV_Japanese")\
         .select("video_id, title, description, channel_title")\
         .eq("is_analyzed", False)\
-        .limit(20).execute()
+        .limit(100).execute()
 
     if not res.data:
         print("解析対象のデータがありません。")
         return
 
     videos = res.data
-    # 毎回違う動画から始まるようにシャッフル
     random.shuffle(videos)
 
-    print(f"📦 合計 {len(videos)} 件の解析を開始します...")
+    print(f"📦 合計 {len(videos)} 件の解析を開始します（15分おきスケジュール設定済み）...")
 
-    # ループ件数を最大20件に拡大
-    for video in videos[:20]:
+    for video in videos:
         video_id = video['video_id']
-        print(f"\n🔍 解析中: {video['title']}")
+        print(f"🔍 解析中: {video['title']}")
         
         prompt = f"""
         YouTube動画情報から歌手名、曲名、タイアップを抽出してJSONで答えて。
@@ -43,8 +41,9 @@ def analyze_videos():
         """
 
         try:
+            # 大量処理のため制限の緩い 8b-instant モデルに変更
             completion = groq_client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
+                model="llama-3.1-8b-instant",
                 messages=[
                     {"role": "system", "content": "JSONのみで回答。項目: singer_name, song_title, tie_up, is_official_mv"},
                     {"role": "user", "content": prompt}
@@ -62,14 +61,14 @@ def analyze_videos():
                 "is_analyzed": True
             }).eq("video_id", video_id).execute()
             
-            print(f"✅ 成功: {result.get('singer_name')} - {result.get('song_title')}")
+            print(f"✅ 成功: {result.get('singer_name')}")
             
-            # 1分間に詰め込みすぎないよう12秒待機 (1分で5件ペース)
-            time.sleep(12)
+            # 8bモデルなら3秒程度の待機で回せるはずです
+            time.sleep(3)
 
         except Exception as e:
             if "429" in str(e):
-                print("⚠️ レート制限(429)に達しました。ここで終了します。")
+                print("⚠️ レート制限(429)に達しました。次回の15分後の実行に委ねます。")
                 break
             print(f"❌ エラー: {e}")
             continue

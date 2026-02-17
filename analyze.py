@@ -1,95 +1,86 @@
 import os
-import base64
-import httpx
 import time
 import random
-from google import genai
-from google.genai import types
+import json
+from groq import Groq
 from supabase import create_client
 
 # 環境変数
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 SB_URL = os.environ.get("SUPABASE_URL")
 SB_KEY = os.environ.get("SUPABASE_ANON_KEY")
 
-client = genai.Client(api_key=GEMINI_API_KEY)
+# クライアント初期化
+groq_client = Groq(api_key=GROQ_API_KEY)
 supabase = create_client(SB_URL, SB_KEY)
 
-def get_image_base64(url):
-    try:
-        resp = httpx.get(url, timeout=10.0)
-        return base64.b64encode(resp.content).decode("utf-8")
-    except: return None
-
-def analyze_with_retry(contents, video_id, max_retries=3):
-    """指数バックオフによるリトライ処理"""
-    for i in range(max_retries):
-        try:
-            response = client.models.generate_content(
-                model="gemini-2.0-flash", # 通らなければ "gemini-1.5-flash" に変更
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema={
-                        "type": "object",
-                        "properties": {
-                            "singer_name": {"type": "string"},
-                            "song_title": {"type": "string"},
-                            "tie_up": {"type": "string"},
-                            "is_official_mv": {"type": "boolean"}
-                        },
-                        "required": ["singer_name", "song_title", "tie_up", "is_official_mv"]
-                    }
-                )
-            )
-            return response.parsed
-        except Exception as e:
-            if "429" in str(e) and i < max_retries - 1:
-                wait_time = (2 ** i) * 30 + random.uniform(0, 10)
-                print(f"⚠️ 制限中... {wait_time:.1f}秒後にリトライします ({i+1}/{max_retries})")
-                time.sleep(wait_time)
-            else:
-                raise e
-
-def analyze_videos():
+def analyze_videos_with_groq():
+    # 未解析データを20件取得
     res = supabase.table("YouTubeMV_Japanese")\
-        .select("video_id, title, description, thumbnail_url, channel_title")\
+        .select("video_id, title, description, channel_title")\
         .eq("is_analyzed", False)\
-        .limit(10).execute()
+        .limit(20).execute()
 
     if not res.data:
-        print("解析対象なし")
+        print("解析対象のデータがありません。")
         return
 
     videos = res.data
     random.shuffle(videos)
 
-    for video in videos[:3]: # 1回のRunで3件まで確実に狙う
-        video_id = video['video_id']
-        print(f"\n🔍 解析開始: {video['title']}")
+    for video in videos[:10]: # Groqは速いので少し多めに回せます
+        print(f"\n🔍 Groqで解析中: {video['title']}")
         
-        img_b64 = get_image_base64(video['thumbnail_url'])
-        prompt = f"以下の動画の歌手名、曲名、タイアップを特定して。\nタイトル: {video['title']}\n概要: {video['description'][:500]}"
+        # Llama 3 70B（高性能モデル）を使用
+        prompt = f"""
+        以下のYouTube動画の情報から、歌手名、曲名、タイアップ情報を特定し、JSON形式で回答してください。
+        
+        【動画タイトル】: {video['title']}
+        【チャンネル名】: {video['channel_title']}
+        【概要欄】: {video['description'][:800]}
+
+        【出力フォーマット】
+        {{
+          "singer_name": "歌手の正式名称",
+          "song_title": "純粋な曲名のみ",
+          "tie_up": "タイアップ作品名（不明なら「なし」）",
+          "is_official_mv": true/false (公式MV本編ならtrue)
+        }}
+        """
 
         try:
-            contents = [prompt]
-            if img_b64:
-                contents.append(types.Part.from_bytes(data=base64.b64decode(img_b64), mime_type="image/jpeg"))
+            completion = groq_client.chat.completions.create(
+                model="llama3-70b-8192", # 高精度な70Bモデルを指定
+                messages=[
+                    {"role": "system", "content": "あなたは日本の音楽業界に詳しい専門家です。必ず指定されたJSON形式のみで回答してください。"},
+                    {"role": "user", "content": prompt}
+                ],
+                response_format={"type": "json_object"}
+            )
 
-            result = analyze_with_retry(contents, video_id)
+            # 解析結果のパース
+            result = json.loads(completion.choices[0].message.content)
 
+            # Supabaseを更新
             supabase.table("YouTubeMV_Japanese").update({
-                "singer_name": result.singer_name, "song_title": result.song_title,
-                "tie_up": result.tie_up, "is_official_mv": result.is_official_mv,
+                "singer_name": result["singer_name"],
+                "song_title": result["song_title"],
+                "tie_up": result["tie_up"],
+                "is_official_mv": result["is_official_mv"],
                 "is_analyzed": True
-            }).eq("video_id", video_id).execute()
+            }).eq("video_id", video['video_id']).execute()
             
-            print(f"✅ 解析成功: {result.singer_name}")
-            time.sleep(10)
+            print(f"✅ 解析成功: {result['singer_name']} - {result['song_title']}")
+            
+            # Groqは短時間の連投に厳しい（RPM制限）ので、3〜5秒ほど待機
+            time.sleep(5)
 
         except Exception as e:
-            print(f"❌ 最終エラー: {e}")
+            print(f"❌ エラー: {e}")
+            if "rate_limit" in str(e).lower():
+                print("⏳ Groqのレート制限に達しました。少し長めに待機します...")
+                time.sleep(30)
             continue
 
 if __name__ == "__main__":
-    analyze_videos()
+    analyze_videos_with_groq()

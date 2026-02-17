@@ -12,12 +12,11 @@ SB_KEY = os.environ.get("SUPABASE_ANON_KEY")
 youtube = build("youtube", "v3", developerKey=YOUTUBE_API_KEY)
 supabase = create_client(SB_URL, SB_KEY)
 
-# 今回ご指定いただいた4つのプレイリストID
+# 今回新しくご指定いただいた3つのプレイリストID
 PLAYLIST_IDS = [
-    "PLIyWtPwrYr7aN6ky3ge4_0hhO1cTakEwn", # 1つ目
-    "PLH8SlvExlZpGuGWhKHr6FjKvYJ7zGoc-5", # 2つ目
-    "PLH8SlvExlZpGE15cTTg6KScRAAAJPiRK3", # 3つ目
-    "PLH8SlvExlZpEpZ3n8Lr81m26FpBUp5yCC"  # 4つ目
+    "PL_yex3sFlQmWy0J9HYdjkgWToqkryivea", # 1つ目
+    "PLH8SlvExlZpEpZ3n8Lr81m26FpBUp5yCC", # 2つ目
+    "PLIyWtPwrYr7Yqqj0-n0Sc4tPlaYSfoeGS"  # 3つ目
 ]
 
 def fetch_playlist_videos(playlist_id):
@@ -28,7 +27,7 @@ def fetch_playlist_videos(playlist_id):
     
     try:
         while True:
-            # 1. プレイリスト内の動画IDを取得
+            # 1. プレイリスト内の動画ID一覧を取得
             res = youtube.playlistItems().list(
                 playlistId=playlist_id,
                 part="contentDetails",
@@ -40,7 +39,7 @@ def fetch_playlist_videos(playlist_id):
             if not video_ids:
                 break
 
-            # 2. 動画の詳細（タイトル、再生数、時間など）をバッチ取得
+            # 2. 各動画の詳細情報（タイトル、再生数、時間など）を取得
             stats_res = youtube.videos().list(
                 id=",".join(video_ids),
                 part="snippet,statistics,contentDetails"
@@ -66,18 +65,18 @@ def fetch_playlist_videos(playlist_id):
             if not next_page_token:
                 break
 
-        # 3. Supabaseへアップサート（重複は上書き）
+        # 3. Supabaseへの書き込み（upsertなので重複は自動更新）
         if videos_to_insert:
             supabase.table("YouTubeMV_Japanese").upsert(
                 videos_to_insert, on_conflict="video_id"
             ).execute()
-            print(f"✅ {len(videos_to_insert)} 件のデータを保存・更新しました")
+            print(f"✅ このリストから {len(videos_to_insert)} 件のデータを処理しました")
 
     except HttpError as e:
-        print(f"❌ APIエラー: {e}")
+        print(f"❌ APIエラーが発生しました: {e}")
 
 if __name__ == "__main__":
     for pl_id in PLAYLIST_IDS:
         fetch_playlist_videos(pl_id)
-        time.sleep(1) # 短時間アクセスの回避
-    print("\n🎉 指定された全プレイリストの同期が完了しました")
+        time.sleep(1) # API負荷軽減
+    print("\n🎉 指定されたすべてのプレイリストの同期が完了しました")

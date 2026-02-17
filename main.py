@@ -1,6 +1,5 @@
 import os
 import time
-import re
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from supabase import create_client
@@ -13,11 +12,11 @@ SB_KEY = os.environ.get("SUPABASE_ANON_KEY")
 youtube = build("youtube", "v3", developerKey=YOUTUBE_API_KEY)
 supabase = create_client(SB_URL, SB_KEY)
 
-# 対象のプレイリストIDリスト
+# 新しく指定されたプレイリストIDリスト
 PLAYLIST_IDS = [
-    "PL8NVbI3ifBL-eFltStZdscEWwqP37MTLr",
-    "PL_yex3sFlQmWy0J9HYdjkgWToqkryivea",
-    "PLIyWtPwrYr7aN6ky3ge4_0hhO1cTakEwn"
+    "PLH8SlvExlZpGuGWhKHr6FjKvYJ7zGoc-5",
+    "PL_yex3sFlQmUIVO0sWd86NIVe7cSvtGbs",
+    "PLiNIFt_GD2-Dzfi2XoHtgsk8eMLfOEwUw"
 ]
 
 def fetch_playlist_videos(playlist_id):
@@ -28,10 +27,10 @@ def fetch_playlist_videos(playlist_id):
     
     try:
         while True:
-            # 1. プレイリスト内の動画一覧を取得 (playlistItems)
+            # 1. プレイリスト内の動画ID一覧を取得
             res = youtube.playlistItems().list(
                 playlistId=playlist_id,
-                part="snippet,contentDetails",
+                part="contentDetails",
                 maxResults=50,
                 pageToken=next_page_token
             ).execute()
@@ -40,8 +39,7 @@ def fetch_playlist_videos(playlist_id):
             if not video_ids:
                 break
 
-            # 2. 動画の統計情報（再生数など）を取得したい場合は videos.list を呼ぶ
-            # プレイリストアイテムだけでは再生数が取れないため
+            # 2. 各動画の詳細情報（タイトル、再生数、再生時間など）を取得
             stats_res = youtube.videos().list(
                 id=",".join(video_ids),
                 part="snippet,statistics,contentDetails"
@@ -57,7 +55,7 @@ def fetch_playlist_videos(playlist_id):
                     "description": snippet.get('description', '')[:1000],
                     "channel_title": snippet['channelTitle'],
                     "thumbnail_url": snippet['thumbnails'].get('high', {}).get('url'),
-                    "view_count": int(stats.get('viewCount', 0)),
+                    "view_count": int(stats.get('viewCount', 0)) if 'viewCount' in stats else 0,
                     "duration": item['contentDetails']['duration'],
                     "published_at": snippet['publishedAt'],
                     "is_analyzed": False
@@ -67,13 +65,12 @@ def fetch_playlist_videos(playlist_id):
             if not next_page_token:
                 break
 
-        # 3. Supabaseへの書き込み
+        # 3. Supabaseへの書き込み（重複は上書き）
         if videos_to_insert:
-            # 重複を考慮したUpsert
             supabase.table("YouTubeMV_Japanese").upsert(
                 videos_to_insert, on_conflict="video_id"
             ).execute()
-            print(f"✅ {len(videos_to_insert)} 件のデータを処理しました")
+            print(f"✅ このリストから {len(videos_to_insert)} 件のデータを処理しました")
 
     except HttpError as e:
         print(f"❌ APIエラー: {e}")
@@ -81,5 +78,5 @@ def fetch_playlist_videos(playlist_id):
 if __name__ == "__main__":
     for pl_id in PLAYLIST_IDS:
         fetch_playlist_videos(pl_id)
-        time.sleep(1)
+        time.sleep(1) # API負荷軽減のための待機
     print("\n🎉 全てのプレイリストの処理が完了しました")

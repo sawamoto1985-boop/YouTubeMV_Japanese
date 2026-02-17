@@ -12,11 +12,11 @@ SB_KEY = os.environ.get("SUPABASE_ANON_KEY")
 youtube = build("youtube", "v3", developerKey=YOUTUBE_API_KEY)
 supabase = create_client(SB_URL, SB_KEY)
 
-# 新しく指定されたプレイリストIDリスト
+# 今回ご指定いただいた新しいプレイリストID
 PLAYLIST_IDS = [
-    "PLH8SlvExlZpGuGWhKHr6FjKvYJ7zGoc-5",
-    "PL_yex3sFlQmUIVO0sWd86NIVe7cSvtGbs",
-    "PLiNIFt_GD2-Dzfi2XoHtgsk8eMLfOEwUw"
+    "PLH8SlvExlZpGuGWhKHr6FjKvYJ7zGoc-5", # 1つ目
+    "PL_yex3sFlQmUIVO0sWd86NIVe7cSvtGbs", # 2つ目
+    "PLiNIFt_GD2-Dzfi2XoHtgsk8eMLfOEwUw"  # 3つ目
 ]
 
 def fetch_playlist_videos(playlist_id):
@@ -30,16 +30,17 @@ def fetch_playlist_videos(playlist_id):
             # 1. プレイリスト内の動画ID一覧を取得
             res = youtube.playlistItems().list(
                 playlistId=playlist_id,
-                part="contentDetails",
+                part="contentDetails,snippet",
                 maxResults=50,
                 pageToken=next_page_token
             ).execute()
             
+            # 動画IDのリストを作成
             video_ids = [item['contentDetails']['videoId'] for item in res.get('items', [])]
             if not video_ids:
                 break
 
-            # 2. 各動画の詳細情報（タイトル、再生数、再生時間など）を取得
+            # 2. 動画の詳細情報（再生数、再生時間など）を取得
             stats_res = youtube.videos().list(
                 id=",".join(video_ids),
                 part="snippet,statistics,contentDetails"
@@ -65,18 +66,18 @@ def fetch_playlist_videos(playlist_id):
             if not next_page_token:
                 break
 
-        # 3. Supabaseへの書き込み（重複は上書き）
+        # 3. Supabaseへの書き込み（upsertなので重複は自動更新）
         if videos_to_insert:
             supabase.table("YouTubeMV_Japanese").upsert(
                 videos_to_insert, on_conflict="video_id"
             ).execute()
-            print(f"✅ このリストから {len(videos_to_insert)} 件のデータを処理しました")
+            print(f"✅ 合計 {len(videos_to_insert)} 件のデータを保存/更新しました")
 
     except HttpError as e:
-        print(f"❌ APIエラー: {e}")
+        print(f"❌ APIエラーが発生しました: {e}")
 
 if __name__ == "__main__":
     for pl_id in PLAYLIST_IDS:
         fetch_playlist_videos(pl_id)
-        time.sleep(1) # API負荷軽減のための待機
-    print("\n🎉 全てのプレイリストの処理が完了しました")
+        time.sleep(1) # API制限を考慮した待機
+    print("\n🎉 指定された全プレイリストの同期が完了しました")

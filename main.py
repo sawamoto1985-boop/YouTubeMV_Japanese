@@ -12,7 +12,6 @@ SB_KEY = os.environ.get("SUPABASE_ANON_KEY")
 youtube = build("youtube", "v3", developerKey=YOUTUBE_API_KEY)
 supabase = create_client(SB_URL, SB_KEY)
 
-# 今回ご指定いただいた16個のプレイリストID
 PLAYLIST_IDS = [
     "PLlguE8B_AmTOrSSERku8HjzuMPMEJMDjA",
     "PLIyWtPwrYr7bpfvf7W71MrugiqvSXjSCh",
@@ -35,12 +34,12 @@ PLAYLIST_IDS = [
 def fetch_playlist_videos(playlist_id):
     print(f"\n📂 プレイリスト ID: {playlist_id} の取得を開始します")
     
-    videos_to_insert = []
+    # 辞書型を使い、video_idをキーにして重複を自動排除する
+    unique_videos = {}
     next_page_token = None
     
     try:
         while True:
-            # 1. プレイリスト内の動画ID一覧を取得
             res = youtube.playlistItems().list(
                 playlistId=playlist_id,
                 part="contentDetails",
@@ -52,18 +51,19 @@ def fetch_playlist_videos(playlist_id):
             if not video_ids:
                 break
 
-            # 2. 動画の詳細情報（タイトル、再生数、時間など）を取得
             stats_res = youtube.videos().list(
                 id=",".join(video_ids),
                 part="snippet,statistics,contentDetails"
             ).execute()
 
             for item in stats_res.get('items', []):
+                v_id = item['id']
                 snippet = item['snippet']
                 stats = item.get('statistics', {})
                 
-                videos_to_insert.append({
-                    "video_id": item['id'],
+                # 重複があっても新しい方のデータで上書き（エラーにならない）
+                unique_videos[v_id] = {
+                    "video_id": v_id,
                     "title": snippet['title'],
                     "description": snippet.get('description', '')[:1000],
                     "channel_title": snippet['channelTitle'],
@@ -72,24 +72,26 @@ def fetch_playlist_videos(playlist_id):
                     "duration": item['contentDetails']['duration'],
                     "published_at": snippet['publishedAt'],
                     "is_analyzed": False
-                })
+                }
 
             next_page_token = res.get('nextPageToken')
             if not next_page_token:
                 break
 
-        # 3. Supabaseへの書き込み（重複は上書き更新）
-        if videos_to_insert:
+        # 辞書の値をリストに変換して書き込み
+        final_list = list(unique_videos.values())
+        
+        if final_list:
             supabase.table("YouTubeMV_Japanese").upsert(
-                videos_to_insert, on_conflict="video_id"
+                final_list, on_conflict="video_id"
             ).execute()
-            print(f"✅ このリストから {len(videos_to_insert)} 件のデータを保存・更新しました")
+            print(f"✅ 合計 {len(final_list)} 件のデータを保存・更新しました")
 
-    except HttpError as e:
-        print(f"❌ APIエラー: {e}")
+    except Exception as e:
+        print(f"❌ エラーが発生しました: {e}")
 
 if __name__ == "__main__":
     for pl_id in PLAYLIST_IDS:
         fetch_playlist_videos(pl_id)
-        time.sleep(1) # API負荷軽減
-    print("\n🎉 全16件のプレイリスト同期が完了しました")
+        time.sleep(1)
+    print("\n🎉 全ての処理が完了しました")
